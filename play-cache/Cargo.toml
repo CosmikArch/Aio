@@ -1,0 +1,28 @@
+[package]
+name = "play-cache"
+version = "0.1.0"
+edition = "2021"
+
+# ---------------------------------------------------------------------------
+# Library target — cdylib for Go/CGO consumption, rlib so the CLI binary
+# can link the same code without duplicating it.
+# ---------------------------------------------------------------------------
+[lib]
+name = "play_cache"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+# ---------------------------------------------------------------------------
+# CLI binary — stdin/stdout JSON protocol, mirrors the Zig entry point.
+# ---------------------------------------------------------------------------
+[[bin]]
+name = "play-cache"
+path = "src/main.rs"
+
+[dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror  = "1"
+
+[build-dependencies]
+cbindgen = "0.27"
