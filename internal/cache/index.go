@@ -3,6 +3,7 @@ package cache
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,9 +19,9 @@ import (
 type IndexEntry struct {
 	VideoID    string    // YouTube video ID
 	Title      string    // video / track title
-	Artist     string    // music artist tag, or channel fallback
+	Artist     string    // music artist tag — empty when no tag is present; never a channel fallback
 	Album      string    // album tag if present
-	Channel    string    // uploader channel name
+	Channel    string    // uploader channel name — always populated when known
 	UploadDate string    // "YYYYMMDD" as returned by yt-dlp
 	Query      string    // raw human search string (never a video ID)
 	SourceURL  string    // resolved YouTube watch URL
@@ -53,21 +54,71 @@ CREATE INDEX IF NOT EXISTS idx_cached_at ON cache_index (cached_at);
 CREATE INDEX IF NOT EXISTS idx_last_used ON cache_index (last_used);
 `
 
-// migrations adds columns introduced after the initial schema.
-// SQLite errors on duplicate column names; ignoring those errors is the
-// idiomatic migration pattern — no version table required.
-// Rule: indexes on new columns must come AFTER their ALTER TABLE statement.
-var migrations = []string{
-	"ALTER TABLE cache_index ADD COLUMN artist            TEXT    NOT NULL DEFAULT ''",
-	"CREATE INDEX IF NOT EXISTS idx_artist ON cache_index (artist)",
-	"ALTER TABLE cache_index ADD COLUMN album             TEXT    NOT NULL DEFAULT ''",
-	"ALTER TABLE cache_index ADD COLUMN channel           TEXT    NOT NULL DEFAULT ''",
-	"ALTER TABLE cache_index ADD COLUMN upload_date       TEXT    NOT NULL DEFAULT ''",
-	"ALTER TABLE cache_index ADD COLUMN query             TEXT    NOT NULL DEFAULT ''",
-	"ALTER TABLE cache_index ADD COLUMN source_url        TEXT    NOT NULL DEFAULT ''",
-	"ALTER TABLE cache_index ADD COLUMN source_type       TEXT    NOT NULL DEFAULT ''",
-	"ALTER TABLE cache_index ADD COLUMN stream_url        TEXT    NOT NULL DEFAULT ''",
-	"ALTER TABLE cache_index ADD COLUMN stream_expires_at INTEGER NOT NULL DEFAULT 0",
+// schemaMigrationsTable tracks which migrations have been applied.
+// It is created before any migration runs so it is always present.
+const schemaMigrationsTable = `
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version    INTEGER PRIMARY KEY,
+    applied_at INTEGER NOT NULL DEFAULT 0
+);
+`
+
+// versionedMigration pairs a monotonically-increasing version number with the
+// SQL statement that implements the change. Versions are stable — never
+// reorder or renumber existing entries; only append new ones.
+type versionedMigration struct {
+	version int
+	stmt    string
+}
+
+var numberedMigrations = []versionedMigration{
+	{1, "ALTER TABLE cache_index ADD COLUMN artist            TEXT    NOT NULL DEFAULT ''"},
+	{2, "CREATE INDEX IF NOT EXISTS idx_artist ON cache_index (artist)"},
+	{3, "ALTER TABLE cache_index ADD COLUMN album             TEXT    NOT NULL DEFAULT ''"},
+	{4, "ALTER TABLE cache_index ADD COLUMN channel           TEXT    NOT NULL DEFAULT ''"},
+	{5, "ALTER TABLE cache_index ADD COLUMN upload_date       TEXT    NOT NULL DEFAULT ''"},
+	{6, "ALTER TABLE cache_index ADD COLUMN query             TEXT    NOT NULL DEFAULT ''"},
+	{7, "ALTER TABLE cache_index ADD COLUMN source_url        TEXT    NOT NULL DEFAULT ''"},
+	{8, "ALTER TABLE cache_index ADD COLUMN source_type       TEXT    NOT NULL DEFAULT ''"},
+	{9, "ALTER TABLE cache_index ADD COLUMN stream_url        TEXT    NOT NULL DEFAULT ''"},
+	{10, "ALTER TABLE cache_index ADD COLUMN stream_expires_at INTEGER NOT NULL DEFAULT 0"},
+}
+
+// runMigrations applies any pending versioned migrations in order.
+// Each migration is recorded in schema_migrations after it runs (or after
+// confirming it was already applied). Duplicate-column and already-exists
+// errors are treated as "already applied" because new databases declare all
+// columns in the base schema, making these ALTER TABLE statements harmless
+// no-ops that SQLite rejects with those specific errors.
+func runMigrations(d *sql.DB) error {
+	if _, err := d.Exec(schemaMigrationsTable); err != nil {
+		return fmt.Errorf("schema_migrations table: %w", err)
+	}
+	now := time.Now().Unix()
+	for _, m := range numberedMigrations {
+		var n int
+		_ = d.QueryRow("SELECT COUNT(*) FROM schema_migrations WHERE version = ?", m.version).Scan(&n)
+		if n > 0 {
+			continue // already recorded as applied
+		}
+		_, execErr := d.Exec(m.stmt)
+		if execErr != nil {
+			msg := execErr.Error()
+			// Idempotent operations: column/index already present is not a
+			// failure — it means the base schema already includes this change.
+			if !strings.Contains(msg, "duplicate column name") &&
+				!strings.Contains(msg, "already exists") {
+				return fmt.Errorf("migration %d: %w", m.version, execErr)
+			}
+		}
+		if _, err := d.Exec(
+			"INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+			m.version, now,
+		); err != nil {
+			return fmt.Errorf("recording migration %d: %w", m.version, err)
+		}
+	}
+	return nil
 }
 
 var (
@@ -102,8 +153,8 @@ func getDB() *sql.DB {
 			panic("cache: schema init failed: " + err.Error())
 		}
 
-		for _, m := range migrations {
-			d.Exec(m) // duplicate-column / duplicate-index errors intentionally ignored
+		if err := runMigrations(d); err != nil {
+			panic("cache: migration failed: " + err.Error())
 		}
 
 		gdb = d
@@ -112,6 +163,10 @@ func getDB() *sql.DB {
 	return gdb
 }
 
+// importLegacyJSON migrates the old flat .index.json file into SQLite.
+// On success it removes the source file. On unmarshal failure it renames the
+// file to .index.json.corrupt so the broken file is not retried on every
+// startup, and logs the problem so the operator can inspect it.
 func importLegacyJSON(d *sql.DB) {
 	legacyPath := filepath.Join(config.CacheDir, ".index.json")
 	data, err := os.ReadFile(legacyPath)
@@ -125,6 +180,12 @@ func importLegacyJSON(d *sql.DB) {
 	}
 	var m map[string]legacyEntry
 	if err := json.Unmarshal(data, &m); err != nil {
+		corruptPath := legacyPath + ".corrupt"
+		if renameErr := os.Rename(legacyPath, corruptPath); renameErr != nil {
+			config.Logger.Printf("importLegacyJSON: corrupt index (unmarshal: %v); rename failed: %v — manual cleanup required: %s", err, renameErr, legacyPath)
+		} else {
+			config.Logger.Printf("importLegacyJSON: corrupt index moved to %s (unmarshal: %v)", corruptPath, err)
+		}
 		return
 	}
 
@@ -179,21 +240,27 @@ func LookupEntry(query string) (IndexEntry, bool) {
 	e.LastUsed = time.Unix(lastUsed, 0)
 
 	now := time.Now().Unix()
-	go d.Exec(`
-		UPDATE cache_index SET last_used = ?, hit_count = hit_count + 1
-		WHERE key = ?
-	`, now, query)
+	go func() {
+		if _, err := d.Exec(`
+			UPDATE cache_index SET last_used = ?, hit_count = hit_count + 1
+			WHERE key = ?
+		`, now, query); err != nil && config.Logger != nil {
+			config.Logger.Printf("cache: LookupEntry bump failed for key %q: %v", query, err)
+		}
+	}()
 
 	return e, true
 }
 
 // SaveEntry persists a key → IndexEntry mapping. On conflict all metadata
 // fields and last_used are refreshed; cached_at and hit_count are preserved.
-func SaveEntry(key string, entry IndexEntry) {
+// Returns an error if the write fails so callers can detect data-loss conditions
+// (disk full, locked DB, schema mismatch).
+func SaveEntry(key string, entry IndexEntry) error {
 	d := getDB()
 	now := time.Now().Unix()
 
-	d.Exec(`
+	_, err := d.Exec(`
 		INSERT INTO cache_index
 		    (key, video_id, title, artist, album, channel, upload_date,
 		     query, source_url, source_type, cached_at, last_used, hit_count)
@@ -216,19 +283,22 @@ func SaveEntry(key string, entry IndexEntry) {
 		entry.Query, entry.SourceURL, entry.SourceType,
 		now, now,
 	)
+	return err
 }
 
 // SaveStreamURL stores a short-lived CDN stream URL for all rows with this video_id.
-func SaveStreamURL(videoID, streamURL string, ttl time.Duration) {
+// Returns an error if the write fails.
+func SaveStreamURL(videoID, streamURL string, ttl time.Duration) error {
 	if videoID == "" || streamURL == "" {
-		return
+		return nil
 	}
 	d := getDB()
 	expires := time.Now().Add(ttl).Unix()
-	d.Exec(`
+	_, err := d.Exec(`
 		UPDATE cache_index SET stream_url = ?, stream_expires_at = ?
 		WHERE video_id = ?
 	`, streamURL, expires, videoID)
+	return err
 }
 
 // LookupStreamURL returns a non-expired direct stream URL for videoID, or "".
@@ -249,9 +319,11 @@ func LookupStreamURL(videoID string) string {
 }
 
 // PurgeEntry removes every row whose video_id matches — O(log n) via index.
-func PurgeEntry(videoID string) {
+// Returns an error if the delete fails.
+func PurgeEntry(videoID string) error {
 	d := getDB()
-	d.Exec(`DELETE FROM cache_index WHERE video_id = ?`, videoID)
+	_, err := d.Exec(`DELETE FROM cache_index WHERE video_id = ?`, videoID)
+	return err
 }
 
 // ManifestEntry is the public JSON-serialisable shape of one cached track.
@@ -272,8 +344,19 @@ type ManifestEntry struct {
 }
 
 // manifestQuery is the shared SELECT used by both ListManifest and SearchManifest.
-// It groups by video_id, picks the human query from the non-ID key row, and
-// aggregates timestamps across all keys for the same video.
+// It groups by video_id and aggregates across all key rows for the same video.
+//
+// Aggregation strategy per column:
+//   - title, album, channel, upload_date, source_url, source_type: identical
+//     across all rows for a given video (same yt-dlp output), so MAX() is safe.
+//   - artist: stored as the raw music-artist tag or empty string — never a
+//     channel-name fallback (that conflation was removed from parseMeta).
+//     MAX(artist) therefore correctly promotes a real tag over empty rows.
+//   - query: CASE guard excludes the bare video-ID row so the human search
+//     string is preferred.
+//   - hit_count: SUM across all keys for a holistic play count.
+//   - cached_at: MIN (first time this video appeared in the cache).
+//   - last_used: MAX (most recent access from any key).
 const manifestQuery = `
 	SELECT
 	    video_id,
@@ -334,6 +417,11 @@ func ListManifest() ([]ManifestEntry, error) {
 // SearchManifest returns entries whose title, artist, album, channel, query,
 // or video_id contain ALL of the provided terms (case-insensitive AND logic).
 // An empty terms slice returns all entries, identical to ListManifest.
+//
+// Search operates on raw (pre-aggregation) rows so that a term matching a
+// non-MAX value of any column still produces a result. Each term is translated
+// into a subquery that finds matching video_ids directly in cache_index; the
+// outer query then aggregates only those videos.
 func SearchManifest(terms []string) ([]ManifestEntry, error) {
 	if len(terms) == 0 {
 		return ListManifest()
@@ -341,31 +429,32 @@ func SearchManifest(terms []string) ([]ManifestEntry, error) {
 
 	d := getDB()
 
-	// Build a WHERE clause that ANDs one predicate block per term.
-	// Each predicate ORs across all searchable columns.
-	// Using LOWER() + LIKE for portable case-insensitive matching without
-	// needing a COLLATE NOCASE column definition.
-	var clauses []string
+	// One IN-subquery per term, ANDed together. Each subquery scans raw rows
+	// rather than aggregated values, so a match in any row for a video is
+	// sufficient — including rows whose artist/title/query is not the MAX value.
+	var subqueries []string
 	var args []interface{}
 
 	for _, term := range terms {
 		pattern := "%" + strings.ToLower(term) + "%"
-		clauses = append(clauses, `(
-			LOWER(title)   LIKE ? OR
-			LOWER(artist)  LIKE ? OR
-			LOWER(album)   LIKE ? OR
-			LOWER(channel) LIKE ? OR
-			LOWER(query)   LIKE ? OR
-			video_id        =   ?
-		)`)
+		subqueries = append(subqueries, `
+			video_id IN (
+				SELECT DISTINCT video_id FROM cache_index
+				WHERE LOWER(title)   LIKE ? OR
+				      LOWER(artist)  LIKE ? OR
+				      LOWER(album)   LIKE ? OR
+				      LOWER(channel) LIKE ? OR
+				      LOWER(query)   LIKE ? OR
+				      video_id        =   ?
+			)`)
 		args = append(args, pattern, pattern, pattern, pattern, pattern, term)
 	}
 
-	having := "HAVING " + strings.Join(clauses, " AND ")
+	where := "WHERE " + strings.Join(subqueries, " AND ")
 
 	rows, err := d.Query(manifestQuery+`
+		`+where+`
 		GROUP BY video_id
-		`+having+`
 		ORDER BY last_used DESC
 	`, args...)
 	if err != nil {

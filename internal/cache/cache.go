@@ -120,7 +120,9 @@ func EnforceSize() {
 		info, err := os.Stat(filePath)
 		if err != nil {
 			// File is gone from disk but index row still exists — clean up.
-			PurgeEntry(videoID)
+			if err := PurgeEntry(videoID); err != nil && config.Logger != nil {
+				config.Logger.Printf("EnforceSize: PurgeEntry(%s) after missing file: %v", videoID, err)
+			}
 			continue
 		}
 
@@ -129,7 +131,9 @@ func EnforceSize() {
 			continue // another process may hold the file; skip silently
 		}
 
-		PurgeEntry(videoID)
+		if err := PurgeEntry(videoID); err != nil && config.Logger != nil {
+			config.Logger.Printf("EnforceSize: PurgeEntry(%s) after eviction: %v", videoID, err)
+		}
 		totalBytes -= fileSize
 
 		if config.Logger != nil {
@@ -153,7 +157,7 @@ func CleanStaleEntries() {
 	protected := map[string]bool{
 		config.LogFile:              true,
 		config.MpvPidFile:           true,
-		config.MpvSocketFile:        true, // unix socket — must survive for the lifetime of mpv
+		config.MpvSocketFile:        true,
 		config.DaemonPidFile:        true,
 		config.HistoryFile:          true,
 		config.QueueFile:            true,
@@ -163,12 +167,39 @@ func CleanStaleEntries() {
 		config.CacheDBFile + "-shm": true,
 	}
 
+	// Build a map of videoID -> DB last_used for audio-file expiry decisions.
+	// We use DB last_used instead of file mtime because TagCachedFiles re-muxes
+	// files through ffmpeg and atomically renames the result, resetting mtime
+	// independently of when the file was last played. Using mtime would let
+	// frequently-tagged files accumulate beyond CacheExpiryDays indefinitely.
+	dbLastUsed := make(map[string]int64)
+	if d := getDB(); d != nil {
+		rows, err := d.Query(`
+			SELECT video_id, MAX(last_used) AS last_used
+			FROM cache_index
+			GROUP BY video_id
+		`)
+		if err == nil {
+			for rows.Next() {
+				var vid string
+				var lu int64
+				if rows.Scan(&vid, &lu) == nil {
+					dbLastUsed[vid] = lu
+				}
+			}
+			rows.Close()
+		}
+	}
+
 	entries, err := os.ReadDir(config.CacheDir)
 	if err != nil {
 		return
 	}
 
+	audioSuffix := "." + config.AudioFormat
 	now := time.Now()
+	expirySeconds := float64(config.CacheExpiryDays * 86400)
+
 	for _, entry := range entries {
 		path := filepath.Join(config.CacheDir, entry.Name())
 		if protected[path] {
@@ -180,26 +211,39 @@ func CleanStaleEntries() {
 			continue
 		}
 
-		age := now.Sub(info.ModTime()).Seconds()
 		name := entry.Name()
 
 		if strings.HasSuffix(name, ".lock") {
-			if age > config.LockStaleSeconds {
+			if now.Sub(info.ModTime()).Seconds() > config.LockStaleSeconds {
 				os.Remove(path)
 			}
 		} else if strings.Contains(name, ".work.") || strings.HasSuffix(name, ".tmp") {
-			if age > config.LockStaleSeconds {
+			if now.Sub(info.ModTime()).Seconds() > config.LockStaleSeconds {
 				if entry.IsDir() {
 					os.RemoveAll(path)
 				} else {
 					os.Remove(path)
 				}
 			}
-		} else if info.Mode().IsRegular() && age > float64(config.CacheExpiryDays*86400) {
-			os.Remove(path)
-			if strings.HasSuffix(name, "."+config.AudioFormat) {
-				videoID := strings.TrimSuffix(name, "."+config.AudioFormat)
-				PurgeEntry(videoID)
+		} else if info.Mode().IsRegular() && strings.HasSuffix(name, audioSuffix) {
+			// Audio files: use DB last_used for expiry, not file mtime.
+			videoID := strings.TrimSuffix(name, audioSuffix)
+			var age float64
+			if lu, ok := dbLastUsed[videoID]; ok && lu > 0 {
+				age = now.Sub(time.Unix(lu, 0)).Seconds()
+			} else {
+				age = now.Sub(info.ModTime()).Seconds() // fallback: not in DB
+			}
+			if age > expirySeconds {
+				os.Remove(path)
+				if err := PurgeEntry(videoID); err != nil && config.Logger != nil {
+					config.Logger.Printf("CleanStaleEntries: PurgeEntry(%s): %v", videoID, err)
+				}
+			}
+		} else if info.Mode().IsRegular() {
+			// Non-audio files: mtime is fine since nothing resets their timestamps.
+			if now.Sub(info.ModTime()).Seconds() > expirySeconds {
+				os.Remove(path)
 			}
 		}
 	}

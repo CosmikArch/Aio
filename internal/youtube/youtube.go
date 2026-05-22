@@ -115,11 +115,11 @@ func parseMeta(output string) TrackMeta {
 	if meta.Title == "" {
 		meta.Title = "Unknown Title"
 	}
-	// Artist tag is absent on most plain YouTube videos.
-	// Fall back to the channel name so the manifest always has a human-readable name.
-	if meta.Artist == "" {
-		meta.Artist = meta.Channel
-	}
+	// NOTE: Artist is intentionally left empty when the tag is absent.
+	// Channel is always populated separately. The display-time fallback
+	// (artist = channel when artist == "") must be applied by callers, not here.
+	// Conflating the two at fetch time makes it impossible to distinguish a
+	// real music-artist tag from a channel-name stand-in once the value is stored.
 
 	return meta
 }
