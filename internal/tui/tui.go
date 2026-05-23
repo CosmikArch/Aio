@@ -197,12 +197,7 @@ func aliveTickCmd() tea.Cmd {
 	})
 }
 
-type tickMsg struct{}
-func tickCmd() tea.Cmd {
-	return tea.Tick(time.Second, func(_ time.Time) tea.Msg {
-		return tickMsg{}
-	})
-}
+
 
 // ── Search result message ─────────────────────────────────────────────────────
 
@@ -261,13 +256,13 @@ func loadQueue() []item {
 	return items
 }
 
-func writeLines(path string, items []item) {
+func writeLines(path string, items []item) error {
 	var sb strings.Builder
 	for _, it := range items {
 		sb.WriteString(it.query)
 		sb.WriteByte('\n')
 	}
-	os.WriteFile(path, []byte(sb.String()), 0644)
+	return os.WriteFile(path, []byte(sb.String()), 0644)
 }
 
 // ── mpv helpers ───────────────────────────────────────────────────────────────
@@ -372,16 +367,26 @@ func (m model) Init() tea.Cmd {
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
-	case tickMsg:
-		if m.playback.playing {
+	// elapsedTickMsg fires every 250 ms and advances the elapsed counter
+	// only while mpv is playing and not paused.
+	case elapsedTickMsg:
+		if m.playback.playing && !m.playback.paused {
 			m.playback.elapsed = time.Since(m.playback.startedAt)
 		}
+		return m, elapsedTickCmd()
+
+	// aliveTickMsg fires every 5 s and reconciles the playing/paused/muted
+	// flags with the actual mpv process state.
+	case aliveTickMsg:
 		wasPlaying := m.playback.playing
 		m.playback.playing = isMpvRunning()
 		if wasPlaying && !m.playback.playing {
+			// mpv exited on its own — reset all transient state.
 			m.playback.elapsed = 0
+			m.playback.paused = false
+			m.playback.muted = false
 		}
-		return m, tickCmd()
+		return m, aliveTickCmd()
 
 	case searchResultMsg:
 		m.search.loading = false
@@ -482,6 +487,8 @@ func (m model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			player.PlayNew(sel.query, false)
 			m.message = "▶  " + sel.display
 			m.playback.playing = true
+			m.playback.paused = false
+			m.playback.muted = false
 			m.playback.looping = false
 			m.playback.nowPlaying = sel.display
 			m.playback.startedAt = time.Now()
@@ -543,7 +550,16 @@ func (m model) updatePlayback(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case is(key, k.Pause):
 		if isMpvRunning() {
 			pauseMpv()
-			m.message = "Toggled pause."
+			m.playback.paused = !m.playback.paused
+			if m.playback.paused {
+				m.playback.elapsedAtPause = m.playback.elapsed
+				m.message = "⏸  Paused."
+			} else {
+				// Shift startedAt so the elapsed counter resumes from the
+				// correct position rather than jumping forward.
+				m.playback.startedAt = time.Now().Add(-m.playback.elapsedAtPause)
+				m.message = "▶  Resumed."
+			}
 		} else {
 			m.message = "Nothing is playing."
 		}
@@ -568,12 +584,16 @@ func (m model) updatePlayback(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if isMpvRunning() {
 			seekMpv(-30)
 			m.message = "⏪ –30s"
+		} else {
+			m.message = "Nothing is playing."
 		}
 
 	case is(key, k.SeekFwdLong):
 		if isMpvRunning() {
 			seekMpv(30)
 			m.message = "⏩ +30s"
+		} else {
+			m.message = "Nothing is playing."
 		}
 
 	case is(key, k.Mute):
@@ -600,6 +620,8 @@ func (m model) updatePlayback(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case is(key, k.Stop):
 		player.StopAll()
 		m.playback.playing = false
+		m.playback.paused = false
+		m.playback.muted = false
 		m.playback.elapsed = 0
 		m.message = "⏹  Stopped."
 
@@ -651,9 +673,11 @@ func (m model) updateGeneral(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		sel := items[m.cursor[m.activeTab]]
 		player.PlayNew(sel.query, m.playback.looping)
-		m.message = "▶  " + sel.query
+		m.message = "▶  " + sel.display
 		m.playback.playing = true
-		m.playback.nowPlaying = sel.query
+		m.playback.paused = false
+		m.playback.muted = false
+		m.playback.nowPlaying = sel.display
 		m.playback.startedAt = time.Now()
 		m.playback.elapsed = 0
 
@@ -667,7 +691,7 @@ func (m model) updateGeneral(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		queue.Add(sel.query)
 		m.lists[tabQueue] = loadQueue()
 		player.EnsureDaemon()
-		m.message = "➕ Added to queue: " + truncate(sel.query, 40)
+		m.message = "➕ Added to queue: " + truncate(sel.display, 40)
 
 	case is(key, k.Delete):
 		if m.activeTab == tabHistory {
@@ -683,13 +707,18 @@ func (m model) updateGeneral(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if i > 0 && i >= len(m.lists[m.activeTab]) {
 			m.cursor[m.activeTab]--
 		}
+		var writeErr error
 		switch m.activeTab {
 		case tabFavorites:
-			writeLines(config.FavoritesFile, m.lists[tabFavorites])
+			writeErr = writeLines(config.FavoritesFile, m.lists[tabFavorites])
 		case tabQueue:
-			writeLines(config.QueueFile, m.lists[tabQueue])
+			writeErr = writeLines(config.QueueFile, m.lists[tabQueue])
 		}
-		m.message = "Removed."
+		if writeErr != nil {
+			m.message = "Save error: " + writeErr.Error()
+		} else {
+			m.message = "Removed."
+		}
 
 	case is(key, k.Refresh):
 		m.lists[tabFavorites] = loadFavorites()
@@ -705,13 +734,22 @@ func (m model) updateGeneral(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case is(key, k.Stop):
 		player.StopAll()
 		m.playback.playing = false
+		m.playback.paused = false
+		m.playback.muted = false
 		m.playback.elapsed = 0
 		m.message = "⏹  Stopped."
 
 	case is(key, k.Pause):
 		if isMpvRunning() {
 			pauseMpv()
-			m.message = "Toggled pause."
+			m.playback.paused = !m.playback.paused
+			if m.playback.paused {
+				m.playback.elapsedAtPause = m.playback.elapsed
+				m.message = "⏸  Paused."
+			} else {
+				m.playback.startedAt = time.Now().Add(-m.playback.elapsedAtPause)
+				m.message = "▶  Resumed."
+			}
 		} else {
 			m.message = "Nothing is playing."
 		}
@@ -737,9 +775,13 @@ func (m model) View() string {
 
 	nowPlayingStr := ""
 	if m.playback.nowPlaying != "" {
-		icon := "▶"
-		if !m.playback.playing {
-			icon = "⏸"
+		icon := "⏹"
+		if m.playback.playing {
+			if m.playback.paused {
+				icon = "⏸"
+			} else {
+				icon = "▶"
+			}
 		}
 		np := truncate(m.playback.nowPlaying, innerW/2)
 		nowPlayingStr = "  " + dimStyle.Render(icon+" "+np)
@@ -878,6 +920,9 @@ func (m model) viewSearch(innerW int) string {
 	}
 	end := start + visibleLines
 
+	if start > 0 {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  ↑ %d more above\n", start)))
+	}
 	for i := start; i < end && i < len(m.search.results); i++ {
 		line := truncate(m.search.results[i].display, innerW-4)
 		if i == cursor {
@@ -888,6 +933,9 @@ func (m model) viewSearch(innerW int) string {
 		if i < end-1 && i < len(m.search.results)-1 {
 			b.WriteString("\n")
 		}
+	}
+	if remaining := len(m.search.results) - end; remaining > 0 {
+		b.WriteString("\n" + dimStyle.Render(fmt.Sprintf("  ↓ %d more below", remaining)))
 	}
 	return b.String()
 }
@@ -906,7 +954,11 @@ func (m model) viewPlayback(innerW int) string {
 	b.WriteString("\n")
 	status := dimStyle.Render("⏹  Stopped")
 	if m.playback.playing {
-		status = playingStyle.Render("▶  Playing")
+		if m.playback.paused {
+			status = dimStyle.Render("⏸  Paused")
+		} else {
+			status = playingStyle.Render("▶  Playing")
+		}
 	}
 	loopStatus := dimStyle.Render("loop off")
 	if m.playback.looping {
@@ -998,4 +1050,5 @@ func Run() error {
 	_, err := p.Run()
 	return err
 }
+
 
